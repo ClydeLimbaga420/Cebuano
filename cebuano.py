@@ -1,8 +1,12 @@
 import csv
+import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -12,76 +16,102 @@ import requests
 # ============================================================
 
 CATEGORY = "Category:Lingua Libre pronunciation-ceb"
+API_URL = "https://commons.wikimedia.org/w/api.php"
 
 OUTPUT_DIR = Path("cebuano_dataset")
 AUDIO_DIR = OUTPUT_DIR / "audio"
 METADATA_FILE = OUTPUT_DIR / "metadata.csv"
 
-API_URL = "https://commons.wikimedia.org/w/api.php"
-
 USER_AGENT = (
-    "CebuanoSpeechDatasetDownloader/1.0 "
-    "(educational/research project)"
+    "CebuanoSpeechDatasetDownloader/2.0 "
+    "(educational research project; contact: YOUR_EMAIL)"
 )
 
+# Tune these based on Wikimedia's responses.
+MAX_WORKERS = 4
+BATCH_SIZE = 50
+CHUNK_SIZE = 1024 * 1024
 MAX_RETRIES = 6
-CHUNK_SIZE = 1024 * 1024  # 1 MB
-BATCH_SIZE = 50           # titles per imageinfo request (anonymous API limit)
-DOWNLOAD_DELAY = 3.0      # starting seconds between downloads
-MAX_DELAY = 30.0          # adaptive delay ceiling after repeated 429s
+REQUEST_TIMEOUT = (15, 120)
+DOWNLOAD_DELAY = 0.15
 
-current_delay = DOWNLOAD_DELAY
+# Set to True to recheck the size of existing audio files.
+VERIFY_EXISTING_SIZE = True
 
+CSV_FIELDS = [
+    "filename",
+    "text",
+    "speaker",
+    "source",
+    "license",
+    "original_url",
+]
 
-# ============================================================
-# SETUP
-# ============================================================
-
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": USER_AGENT
-})
+_thread_local = threading.local()
 
 
 # ============================================================
-# HTTP WITH RATE-LIMIT HANDLING
+# HTTP SESSIONS
+# One persistent session per worker thread.
 # ============================================================
 
-def get_with_retry(url, **kwargs):
-    """
-    GET with retries. Honors Retry-After on 429/5xx and backs off on
-    other transient errors. Caller must close the response if stream=True.
-    """
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        _thread_local.session = session
 
-    global current_delay
+    return _thread_local.session
 
+
+def retry_after_seconds(response, attempt):
+    value = response.headers.get("Retry-After", "").strip()
+
+    if value:
+        try:
+            return max(0, min(float(value), 120))
+        except ValueError:
+            try:
+                retry_time = parsedate_to_datetime(value)
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=timezone.utc)
+                seconds = (
+                    retry_time - datetime.now(timezone.utc)
+                ).total_seconds()
+                return max(0, min(seconds, 120))
+            except (ValueError, TypeError, OverflowError):
+                pass
+
+    return min(2 ** attempt, 60)
+
+
+def request_with_retry(url, *, stream=False, **kwargs):
+    """Retry transient HTTP failures and network errors."""
     last_error = None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(MAX_RETRIES):
+        response = None
 
         try:
-            response = session.get(url, **kwargs)
+            response = get_session().get(
+                url,
+                stream=stream,
+                timeout=REQUEST_TIMEOUT,
+                **kwargs,
+            )
 
             if response.status_code in (429, 500, 502, 503, 504):
-                last_error = f"HTTP {response.status_code}"
-
-                if response.status_code == 429:
-                    # Throttled: slow down all later downloads too
-                    current_delay = min(current_delay * 2, MAX_DELAY)
-
-                try:
-                    wait = float(response.headers.get("Retry-After", ""))
-                except ValueError:
-                    wait = 5 * 2 ** (attempt - 1)
-
-                wait = min(wait, 120)
+                wait = retry_after_seconds(response, attempt)
+                status = response.status_code
                 response.close()
 
+                if attempt == MAX_RETRIES - 1:
+                    raise RuntimeError(
+                        f"HTTP {status}; retry limit reached"
+                    )
+
                 print(
-                    f"\n  {last_error}, waiting {wait:.0f}s "
-                    f"(attempt {attempt}/{MAX_RETRIES})"
+                    f"\n  HTTP {status}; retrying in {wait:.1f}s"
                 )
                 time.sleep(wait)
                 continue
@@ -89,394 +119,372 @@ def get_with_retry(url, **kwargs):
             response.raise_for_status()
             return response
 
-        except requests.RequestException as e:
-            last_error = e
-            print(
-                f"\n  Request error "
-                f"(attempt {attempt}/{MAX_RETRIES}): {e}"
-            )
-            time.sleep(2 * attempt)
+        except (requests.RequestException, RuntimeError) as exc:
+            last_error = exc
 
-    raise RuntimeError(f"Giving up on {url}: {last_error}")
+            if response is not None:
+                response.close()
+
+            if attempt == MAX_RETRIES - 1:
+                break
+
+            wait = min(2 ** attempt, 60)
+            print(
+                f"\n  Request failed ({attempt + 1}/{MAX_RETRIES}): "
+                f"{exc}; waiting {wait}s"
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Request failed after {MAX_RETRIES} attempts: {last_error}"
+    )
 
 
 # ============================================================
-# GET FILES FROM WIKIMEDIA CATEGORY
+# WIKIMEDIA CATEGORY
 # ============================================================
 
 def get_category_files():
-    """
-    Get every file in the Wikimedia Commons category.
-    Handles API continuation automatically.
-    """
-
     files = []
     continuation = {}
 
-    print("Searching Wikimedia Commons...")
-    print(f"Category: {CATEGORY}")
-    print()
+    print(f"Searching: {CATEGORY}")
 
     while True:
-
         params = {
             "action": "query",
             "format": "json",
+            "formatversion": 2,
             "list": "categorymembers",
             "cmtitle": CATEGORY,
-            "cmnamespace": 6,       # File namespace
+            "cmnamespace": 6,
+            "cmtype": "file",
             "cmlimit": "max",
         }
-
         params.update(continuation)
 
-        response = get_with_retry(
-            API_URL,
-            params=params,
-            timeout=30
-        )
+        with request_with_retry(
+            API_URL, params=params, stream=False
+        ) as response:
+            data = response.json()
 
-        data = response.json()
+        if "error" in data:
+            raise RuntimeError(f"Wikimedia API error: {data['error']}")
 
-        members = data.get("query", {}).get("categorymembers", [])
-
-        for member in members:
+        for member in data.get("query", {}).get("categorymembers", []):
             title = member.get("title", "")
-
-            # We only want WAV files
             if title.lower().endswith(".wav"):
                 files.append(title)
 
-        print(f"Found {len(files)} WAV files...", end="\r")
+        print(f"\rFound {len(files)} WAV files", end="", flush=True)
 
-        if "continue" not in data:
+        continuation = data.get("continue")
+        if not continuation:
             break
 
-        continuation = data["continue"]
+    # Avoid duplicate titles if the category data changes during pagination.
+    files = list(dict.fromkeys(files))
 
-    print()
-    print(f"Total WAV files found: {len(files)}")
-    print()
-
+    print(f"\nTotal unique WAV files: {len(files)}")
     return files
 
 
 # ============================================================
-# GET ORIGINAL FILE INFORMATION
+# FILE INFORMATION IN BATCHES
 # ============================================================
 
 def get_file_infos(titles):
-    """
-    Ask Wikimedia for original file URLs for many titles in one request.
-    Returns {title: info}. Files without imageinfo are omitted.
-    """
-
     params = {
         "action": "query",
         "format": "json",
+        "formatversion": 2,
         "prop": "imageinfo",
-        "iiprop": "url|size|mime|timestamp",
+        "iiprop": "url|size|mime|timestamp|extmetadata",
         "titles": "|".join(titles),
     }
 
-    response = get_with_retry(
-        API_URL,
-        params=params,
-        timeout=30
-    )
+    with request_with_retry(
+        API_URL, params=params, stream=False
+    ) as response:
+        data = response.json()
 
-    query = response.json().get("query", {})
+    if "error" in data:
+        raise RuntimeError(f"Wikimedia API error: {data['error']}")
 
-    # Map normalized titles back to the ones we asked for
-    normalized = {
-        n["to"]: n["from"] for n in query.get("normalized", [])
-    }
+    # API normalization maps requested titles to canonical titles.
+    aliases = {}
+    for item in data.get("query", {}).get("normalized", []):
+        aliases[item["to"]] = item["from"]
+    for item in data.get("query", {}).get("redirects", []):
+        aliases[item["to"]] = item["from"]
 
     result = {}
 
-    for page in query.get("pages", {}).values():
-
-        imageinfo = page.get("imageinfo")
-
-        if not imageinfo:
+    for page in data.get("query", {}).get("pages", []):
+        imageinfos = page.get("imageinfo", [])
+        if not imageinfos:
             continue
 
-        info = imageinfo[0]
+        info = imageinfos[0]
+        metadata = info.get("extmetadata", {})
         title = page.get("title", "")
-        title = normalized.get(title, title)
+        requested_title = aliases.get(title, title)
 
-        result[title] = {
-            "url": info.get("url"),
+        result[requested_title] = {
+            "url": info.get("url", ""),
             "size": info.get("size", 0),
             "mime": info.get("mime", ""),
             "timestamp": info.get("timestamp", ""),
+            "license": metadata.get(
+                "LicenseShortName", {}
+            ).get("value", "Check file page"),
+            "license_url": metadata.get(
+                "LicenseUrl", {}
+            ).get("value", ""),
+            "description_url": page.get("fullurl", ""),
         }
 
+    # Also index by canonical title when it is already the requested title.
     return result
 
 
 # ============================================================
-# PARSE FILENAME
+# FILENAME PARSING
 # ============================================================
 
 def parse_filename(title):
-    """
-    Example:
+    filename = Path(title.removeprefix("File:")).name
+    stem = re.sub(r"\.wav$", "", filename, flags=re.IGNORECASE)
 
-    LL-Q33239 (ceb)-Wu Xielong-Gabi.wav
-
-    becomes:
-
-    speaker = Wu Xielong
-    text = Gabi
-    """
-
-    filename = title
-
-    if filename.startswith("File:"):
-        filename = filename[5:]
-
-    filename = Path(filename).name
-
-    # Remove extension
-    filename_without_ext = re.sub(
-        r"\.wav$",
-        "",
-        filename,
-        flags=re.IGNORECASE
-    )
-
-    # Expected format:
-    #
-    # LL-Q33239 (ceb)-SPEAKER-TEXT
-    #
-    pattern = r"^LL-[^-]+ \(ceb\)-(.+?)-(.+)$"
-
-    match = re.match(
-        pattern,
-        filename_without_ext
-    )
+    match = re.match(r"^LL-[^-]+ \(ceb\)-(.+?)-(.+)$", stem)
 
     if match:
+        return match.group(1).strip(), match.group(2).strip()
 
-        speaker = match.group(1).strip()
-        text = match.group(2).strip()
-
-    else:
-
-        speaker = ""
-        text = filename_without_ext
-
-    return speaker, text
+    return "", stem
 
 
 # ============================================================
-# DOWNLOAD FILE
+# DOWNLOAD
+# Each worker writes to a temporary file, then atomically renames it.
 # ============================================================
 
-def download_file(url, destination, expected_size=None):
-    """
-    Download url to destination. Returns "skipped", "downloaded" or None.
-    """
+def download_file(title, info):
+    url = info.get("url")
+    if not url:
+        return {"title": title, "status": "failed",
+                "error": "No download URL"}
+
+    filename = Path(title.removeprefix("File:")).name
+    destination = AUDIO_DIR / filename
+    temp_path = destination.with_name(destination.name + ".part")
+    expected_size = int(info.get("size") or 0)
 
     if destination.exists():
-
-        if not expected_size:
-            return "skipped"
-
-        if destination.stat().st_size == expected_size:
-            return "skipped"
-
-    print(f"Downloading: {destination.name}")
+        actual_size = destination.stat().st_size
+        if (
+            not VERIFY_EXISTING_SIZE
+            or not expected_size
+            or actual_size == expected_size
+        ):
+            return {
+                "title": title,
+                "status": "skipped",
+                "filename": filename,
+                "info": info,
+            }
 
     try:
-        response = get_with_retry(
-            url,
-            stream=True,
-            timeout=60
-        )
+        # A stale temporary file is safe to discard: downloads restart
+        # from the beginning rather than pretending to resume partial data.
+        temp_path.unlink(missing_ok=True)
 
-        with response:
-
-            total = int(
-                response.headers.get(
-                    "content-length",
-                    expected_size or 0
-                )
-            )
-
+        with request_with_retry(url, stream=True) as response:
+            content_length = response.headers.get("Content-Length")
+            total = int(content_length) if content_length else expected_size
             downloaded = 0
 
-            with open(destination, "wb") as f:
-
-                for chunk in response.iter_content(
-                    chunk_size=CHUNK_SIZE
-                ):
-
+            with temp_path.open("wb") as output:
+                for chunk in response.iter_content(CHUNK_SIZE):
                     if not chunk:
                         continue
-
-                    f.write(chunk)
+                    output.write(chunk)
                     downloaded += len(chunk)
 
-                    if total:
-                        percent = (downloaded / total) * 100
+            if expected_size and downloaded != expected_size:
+                raise IOError(
+                    f"Size mismatch: expected {expected_size}, "
+                    f"received {downloaded}"
+                )
 
-                        print(
-                            f"\r  {percent:6.2f}% "
-                            f"({downloaded / 1024 / 1024:.2f} MB)",
-                            end=""
-                        )
+            if total and downloaded != total:
+                raise IOError(
+                    f"Incomplete response: expected {total}, "
+                    f"received {downloaded}"
+                )
 
-            print()
+        temp_path.replace(destination)
 
-        return "downloaded"
+        if DOWNLOAD_DELAY:
+            time.sleep(DOWNLOAD_DELAY)
 
-    except Exception as e:
+        return {
+            "title": title,
+            "status": "downloaded",
+            "filename": filename,
+            "info": info,
+        }
 
-        print(f"\nDownload failed: {e}")
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        return {
+            "title": title,
+            "status": "failed",
+            "error": str(exc),
+        }
 
-        if destination.exists():
-            destination.unlink()
 
-        return None
+# ============================================================
+# METADATA
+# ============================================================
+
+def load_existing_metadata():
+    rows = {}
+
+    if not METADATA_FILE.exists():
+        return rows
+
+    with METADATA_FILE.open(
+        "r", newline="", encoding="utf-8-sig"
+    ) as file:
+        for row in csv.DictReader(file):
+            if row.get("filename"):
+                rows[row["filename"]] = row
+
+    return rows
+
+
+def write_metadata(rows):
+    """Rewrite atomically to prevent a half-written CSV on interruption."""
+    temp_path = METADATA_FILE.with_suffix(".csv.tmp")
+
+    with temp_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+        for filename in sorted(rows):
+            writer.writerow(rows[filename])
+
+    temp_path.replace(METADATA_FILE)
+
+
+def make_metadata(filename, title, info):
+    speaker, text = parse_filename(title)
+
+    return {
+        "filename": filename,
+        "text": text,
+        "speaker": speaker,
+        "source": "Wikimedia Commons - Lingua Libre",
+        "license": info.get("license") or "Check file page",
+        "original_url": info.get("url", ""),
+    }
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def load_existing_filenames():
-    """
-    Filenames already recorded in metadata.csv, so re-runs don't
-    append duplicate rows.
-    """
-
-    if not METADATA_FILE.exists():
-        return set()
-
-    with open(METADATA_FILE, newline="", encoding="utf-8") as f:
-        return {row["filename"] for row in csv.DictReader(f)}
-
-
 def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("CEBUANO WIKIMEDIA SPEECH DATASET DOWNLOADER")
+    print(f"Concurrent workers: {MAX_WORKERS}")
     print("=" * 60)
-    print()
 
     files = get_category_files()
-
     if not files:
         print("No WAV files found.")
         return
 
-    recorded = load_existing_filenames()
-    metadata_exists = METADATA_FILE.exists()
-
-    metadata_file = open(
-        METADATA_FILE,
-        "a",
-        newline="",
-        encoding="utf-8"
-    )
-
-    writer = csv.writer(metadata_file)
-
-    if not metadata_exists:
-
-        writer.writerow([
-            "filename",
-            "text",
-            "speaker",
-            "source",
-            "license",
-            "original_url"
-        ])
-
+    metadata = load_existing_metadata()
     successful = 0
     failed = 0
-    index = 0
+    skipped = 0
+    completed = 0
 
-    for start in range(0, len(files), BATCH_SIZE):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for start in range(0, len(files), BATCH_SIZE):
+            batch = files[start:start + BATCH_SIZE]
 
-        batch = files[start:start + BATCH_SIZE]
-
-        try:
-            infos = get_file_infos(batch)
-        except Exception as e:
-            print(f"\nCould not get info for batch at {start}: {e}")
-            failed += len(batch)
-            index += len(batch)
-            continue
-
-        for title in batch:
-
-            index += 1
-
-            print()
-            print(f"[{index}/{len(files)}] {title}")
-
-            info = infos.get(title)
-
-            if not info or not info["url"]:
-                print("  Could not get file information.")
-                failed += 1
+            try:
+                infos = get_file_infos(batch)
+            except Exception as exc:
+                print(f"\nMetadata batch failed at {start}: {exc}")
+                failed += len(batch)
                 continue
 
-            url = info["url"]
+            futures = {
+                executor.submit(download_file, title, infos[title]): title
+                for title in batch
+                if title in infos
+            }
 
-            # Preserve Wikimedia filename
-            # (strip "File:" -- ":" on Windows creates an NTFS stream)
-            filename = Path(title.removeprefix("File:")).name
-            destination = AUDIO_DIR / filename
+            missing = [title for title in batch if title not in infos]
+            for title in missing:
+                print(f"\nMissing file information: {title}")
+            failed += len(missing)
 
-            result = download_file(
-                url,
-                destination,
-                info.get("size")
-            )
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                title = result["title"]
+                status = result["status"]
 
-            if not result:
-                failed += 1
-                continue
+                if status in ("downloaded", "skipped"):
+                    filename = result["filename"]
+                    info = result["info"]
 
-            if filename not in recorded:
+                    # Preserve previously recorded rows where possible.
+                    if filename not in metadata:
+                        metadata[filename] = make_metadata(
+                            filename, title, info
+                        )
 
-                speaker, text = parse_filename(title)
+                    if status == "downloaded":
+                        successful += 1
+                    else:
+                        skipped += 1
+                else:
+                    failed += 1
+                    print(
+                        f"\nFAILED: {title}\n  {result.get('error', '')}"
+                    )
 
-                writer.writerow([
-                    filename,
-                    text,
-                    speaker,
-                    "Wikimedia Commons - Lingua Libre",
-                    "CC BY-SA 4.0",
-                    url
-                ])
+                if completed % 10 == 0:
+                    write_metadata(metadata)
 
-                metadata_file.flush()
-                recorded.add(filename)
+                print(
+                    f"\rProcessed {completed + failed}/{len(files)} | "
+                    f"Downloaded: {successful} | Skipped: {skipped} | "
+                    f"Failed: {failed}",
+                    end="",
+                    flush=True,
+                )
 
-            successful += 1
+            # Persist each completed batch, not just at program exit.
+            write_metadata(metadata)
 
-            if result == "downloaded":
-                time.sleep(current_delay)
-
-    metadata_file.close()
-
-    print()
-    print("=" * 60)
+    print("\n\n" + "=" * 60)
     print("DOWNLOAD COMPLETE")
     print("=" * 60)
-
-    print(f"Successful: {successful}")
+    print(f"Downloaded: {successful}")
+    print(f"Skipped:    {skipped}")
     print(f"Failed:     {failed}")
-    print()
-
-    print(f"Audio:      {AUDIO_DIR}")
-    print(f"Metadata:   {METADATA_FILE}")
-    print()
+    print(f"Audio:      {AUDIO_DIR.resolve()}")
+    print(f"Metadata:   {METADATA_FILE.resolve()}")
 
 
 if __name__ == "__main__":
